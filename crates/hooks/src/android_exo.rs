@@ -636,10 +636,19 @@ async fn seed_autoradio() -> bool {
         (m.tracks.clone(), exclude, m.cookies.clone())
     };
     let cookies = cookies.unwrap_or_default();
-    // Same blend as the desktop engine: YouTube's radio woven with the
+    let key = radio_seed_key(&finished);
+    // Prefer a continuation prefetched while the last track was still playing —
+    // that keeps the ~3s network fetch (and the first-track stream resolve) OUT
+    // of the transition, so the radio starts with no gap. Falls back to a fresh
+    // fetch if none was prepared, or the queue changed since it was.
+    //
+    // Same blend as the desktop engine either way: YouTube's radio woven with the
     // ListenBrainz artist graph, both fetched concurrently, the graph on a
     // deadline so a slow lookup never delays the music.
-    let radio = ::server::recommend::blended_continuation(&finished, &cookies, &exclude).await;
+    let radio = match take_prefetched_radio(&key) {
+        Some(r) => r,
+        None => ::server::recommend::blended_continuation(&finished, &cookies, &exclude).await,
+    };
     if radio.is_empty() {
         return false;
     }
@@ -655,6 +664,123 @@ async fn seed_autoradio() -> bool {
     DURATION_MS.store(0, Ordering::Release);
     let _ = engine_tx().send(Cmd::PlayFrom { position_ms: 0 });
     true
+}
+
+// --- Ahead-of-time autoradio prefetch ------------------------------------------
+// The end-of-queue continuation used to fetch (`blended_continuation`, ~3s of
+// network) only once the last track had ALREADY ended — an audible gap when a
+// single song rolls into its radio. These prefetch it on a background thread
+// while the last track is still playing, and warm its first stream, so
+// `seed_autoradio` can start it near-instantly.
+
+/// Start the prefetch this many ms before the last track's end.
+const AUTORADIO_PREFETCH_LEAD_MS: i64 = 30_000;
+/// A prefetch is in flight (its own thread + runtime); don't start a second.
+static RADIO_PREFETCH_INFLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// A continuation prepared for a specific queue tail, waiting for the queue to
+/// end so `seed_autoradio` can adopt it with no fetch.
+fn prefetched_radio() -> &'static Mutex<Option<(String, Vec<Track>)>> {
+    static P: OnceLock<Mutex<Option<(String, Vec<Track>)>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(None))
+}
+
+/// The queue tail a prefetch was last fired for, so it fires exactly once per
+/// tail even as `State` ticks keep arriving.
+fn radio_prefetch_attempted() -> &'static Mutex<Option<String>> {
+    static K: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    K.get_or_init(|| Mutex::new(None))
+}
+
+/// Signature of a queue's tail (length + last path). Changes whenever the queue
+/// is replaced or grows, which invalidates a stale prefetch.
+fn radio_seed_key(tracks: &[Track]) -> String {
+    let last = tracks
+        .last()
+        .map(|t| t.path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("{}:{last}", tracks.len())
+}
+
+/// Take a prefetched continuation only if it was prepared for this exact tail.
+fn take_prefetched_radio(key: &str) -> Option<Vec<Track>> {
+    let mut slot = prefetched_radio().lock().unwrap_or_else(|e| e.into_inner());
+    match slot.as_ref() {
+        Some((k, _)) if k == key => slot.take().map(|(_, r)| r),
+        _ => None,
+    }
+}
+
+/// Called on every ExoPlayer position tick. When the LAST queued track is within
+/// the lead window of its end and autoradio is on, fetch the continuation now on
+/// a background thread (so the single-threaded engine loop keeps running) and
+/// warm its first stream, ready for `seed_autoradio` to start gaplessly.
+fn maybe_prefetch_autoradio(position_ms: i64, duration_ms: i64) {
+    if !AUTORADIO_ON.load(Ordering::Acquire) {
+        return;
+    }
+    if duration_ms <= 0 || duration_ms - position_ms > AUTORADIO_PREFETCH_LEAD_MS {
+        return;
+    }
+    if RADIO_PREFETCH_INFLIGHT.load(Ordering::Acquire) {
+        return;
+    }
+    let (finished, exclude, cookies, key) = {
+        let m = mirror().lock().unwrap_or_else(|e| e.into_inner());
+        if m.tracks.is_empty() || m.index + 1 < m.tracks.len() {
+            return; // not on the last track — nothing to continue from yet
+        }
+        let key = radio_seed_key(&m.tracks);
+        let exclude: std::collections::HashSet<String> = m
+            .tracks
+            .iter()
+            .map(|t| ::server::recommend::track_key(&t.path))
+            .collect();
+        (
+            m.tracks.clone(),
+            exclude,
+            m.cookies.clone().unwrap_or_default(),
+            key,
+        )
+    };
+    // Fire once per tail: skip if we already fetched (or are fetching) for it.
+    {
+        let mut att = radio_prefetch_attempted()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if att.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        *att = Some(key.clone());
+    }
+    RADIO_PREFETCH_INFLIGHT.store(true, Ordering::Release);
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(_) => {
+                RADIO_PREFETCH_INFLIGHT.store(false, Ordering::Release);
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let radio =
+                ::server::recommend::blended_continuation(&finished, &cookies, &exclude).await;
+            if !radio.is_empty() {
+                // Warm the first track's stream so the flip to the radio doesn't
+                // then pay a cold resolve (YouTube only — the resolve cache is
+                // what makes `seed_autoradio`'s PlayFrom instant).
+                if let Some(vid) = radio.first().and_then(video_id) {
+                    let yt = ::server::ytmusic::YouTubeMusicClient::with_cookies(cookies.clone());
+                    let _ = yt.get_stream(&vid).await;
+                }
+                *prefetched_radio().lock().unwrap_or_else(|e| e.into_inner()) = Some((key, radio));
+            }
+            RADIO_PREFETCH_INFLIGHT.store(false, Ordering::Release);
+        });
+    });
 }
 
 async fn handle_event(ev: ExoEvent) {
@@ -722,6 +848,8 @@ async fn handle_event(ev: ExoEvent) {
             if duration_ms > 0 {
                 DURATION_MS.store(duration_ms, Ordering::Release);
             }
+            // Start the autoradio fetch before the last track ends → no gap.
+            maybe_prefetch_autoradio(position_ms, duration_ms);
         }
         ExoEvent::Ended => {
             // ExoPlayer ran out of items. If the mirror still has tracks ahead,

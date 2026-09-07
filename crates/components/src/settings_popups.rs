@@ -21,11 +21,17 @@ pub enum YtAuthMethod {
 }
 
 impl YtAuthMethod {
-    /// Default to the managed-browser auto-login on every desktop platform —
-    /// the CDP cookie path works on Windows too now (it bypasses App-Bound
-    /// Encryption), so it's the recommended "sign in once, stays alive" route.
+    /// Windows and Android default to (and only offer) the one-click in-app
+    /// Google sign-in — no browser to install, no F12/paste. It's surfaced from
+    /// the paste panel (the captured cookies flow through the paste save path),
+    /// so the default there is `PasteCookies`. macOS/Linux keep the managed
+    /// external-browser auto-login as the default, with the full set of methods.
     pub fn default_for_platform() -> Self {
-        Self::BrowserSignin
+        if cfg!(any(target_os = "windows", target_os = "android")) {
+            Self::PasteCookies
+        } else {
+            Self::BrowserSignin
+        }
     }
 }
 
@@ -269,10 +275,15 @@ fn ServerServiceFields(
     // profile's cookies. Hide that option there; manual cookies are
     // the Windows sign-in path.
     use_effect(move || {
-        // OAuth is hidden (broken by Google) — fall back to paste. Browser
-        // sign-in now works on Windows via the headless CDP path, so it's no
-        // longer forced away there.
-        if *yt_auth.peek() == YtAuthMethod::OAuth {
+        // OAuth is hidden (broken by Google) — fall back to paste. On Windows and
+        // Android the ONLY sign-in is the one-click in-app Google login (surfaced
+        // from the paste panel), so coerce the external-browser method away there
+        // too — it isn't offered.
+        let m = *yt_auth.peek();
+        let hidden = m == YtAuthMethod::OAuth
+            || (cfg!(any(target_os = "windows", target_os = "android"))
+                && m == YtAuthMethod::BrowserSignin);
+        if hidden {
             yt_auth.set(YtAuthMethod::PasteCookies);
         }
     });
@@ -280,28 +291,42 @@ fn ServerServiceFields(
     let mut firefox_error = use_signal(|| None::<String>);
     // In-app one-click sign-in (opens a real Google sign-in in an embedded
     // WebView — no external browser, no F12/cookie-paste). Captured cookies land
-    // in `yt_pasted_cookies`, so Save adopts them exactly like a paste. Desktop
-    // only — Android already has its own in-app sign-in via BrowserSignin.
-    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    // in `yt_pasted_cookies`, so Save adopts them exactly like a paste. Available
+    // on desktop AND Android (both route through `player::systemint::start_yt_login`).
+    #[cfg(not(target_arch = "wasm32"))]
     let mut inapp_busy = use_signal(|| false);
-    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    #[cfg(not(target_arch = "wasm32"))]
     let mut inapp_error = use_signal(|| None::<String>);
 
     match server_service() {
         MusicService::YtMusic => {
             let method = yt_auth();
+            // Windows and Android offer ONLY the one-click in-app Google sign-in
+            // (+ anonymous). Other desktops keep the full set, including the
+            // external-browser auto-login.
+            let one_click_only = cfg!(any(target_os = "windows", target_os = "android"));
+            // On the one-click platforms the "paste cookies" method IS the Google
+            // sign-in (the captured cookies flow through the paste save path), so
+            // label its radio accordingly.
+            let signin_label = if one_click_only {
+                "Sign in with Google".to_string()
+            } else {
+                i18n::t("yt_auth_paste").to_string()
+            };
             rsx! {
-                // Auth method selector. Browser sign-in (auto-login) is shown on
-                // all desktop platforms — the CDP refresh path works on Windows.
+                // Auth-method selector. The external-browser auto-login is hidden
+                // on Windows/Android (the in-app Google login replaces it there).
                 div { class: "flex flex-col gap-2 mb-2",
-                    label { class: "flex items-center gap-2 text-sm text-white cursor-pointer",
-                        input {
-                            r#type: "radio",
-                            name: "yt-auth-method",
-                            checked: method == YtAuthMethod::BrowserSignin,
-                            onchange: move |_| yt_auth.set(YtAuthMethod::BrowserSignin),
+                    if !one_click_only {
+                        label { class: "flex items-center gap-2 text-sm text-white cursor-pointer",
+                            input {
+                                r#type: "radio",
+                                name: "yt-auth-method",
+                                checked: method == YtAuthMethod::BrowserSignin,
+                                onchange: move |_| yt_auth.set(YtAuthMethod::BrowserSignin),
+                            }
+                            span { "{i18n::t(\"yt_auth_browser\")}" }
                         }
-                        span { "{i18n::t(\"yt_auth_browser\")}" }
                     }
                     // NOTE: the OAuth ("Sign in with Google") method is hidden —
                     // Google disabled OAuth against the YouTube Music InnerTube
@@ -316,7 +341,7 @@ fn ServerServiceFields(
                             checked: method == YtAuthMethod::PasteCookies,
                             onchange: move |_| yt_auth.set(YtAuthMethod::PasteCookies),
                         }
-                        span { "{i18n::t(\"yt_auth_paste\")}" }
+                        span { "{signin_label}" }
                     }
                     label { class: "flex items-center gap-2 text-sm text-white cursor-pointer",
                         input {
@@ -341,7 +366,7 @@ fn ServerServiceFields(
                         // real Google sign-in in an embedded WebView and captures
                         // the session; the manual steps below stay as a fallback.
                         {
-                            #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+                            #[cfg(not(target_arch = "wasm32"))]
                             {
                                 rsx! {
                                     button {
@@ -397,66 +422,79 @@ fn ServerServiceFields(
                                             "A sign-in window has opened. Finish signing in there; this closes on its own."
                                         }
                                     }
-                                    div { class: "text-[10px] text-white/30 uppercase tracking-wider mb-2", "— or paste cookies manually —" }
+                                    // The manual cookie fallback only exists on the
+                                    // non-one-click platforms; no divider otherwise.
+                                    if !one_click_only {
+                                        div { class: "text-[10px] text-white/30 uppercase tracking-wider mb-2", "— or paste cookies manually —" }
+                                    }
                                 }
                             }
-                            #[cfg(any(target_arch = "wasm32", target_os = "android"))]
+                            #[cfg(target_arch = "wasm32")]
                             {
                                 rsx! {}
                             }
                         }
-                        ol { class: "text-xs text-white/60 list-decimal list-inside space-y-0.5 mb-2",
-                            li { "{i18n::t(\"yt_paste_step1\")}" }
-                            li { "{i18n::t(\"yt_paste_step2\")}" }
-                            li { "{i18n::t(\"yt_paste_step3\")}" }
-                        }
-                        textarea {
-                            class: "w-full h-24 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white text-xs font-mono placeholder:text-white/30 focus:outline-none focus:border-indigo-400 resize-y",
-                            placeholder: "VISITOR_INFO1_LIVE=…; SID=…; SAPISID=…; …",
-                            value: "{yt_pasted_cookies()}",
-                            oninput: move |e| yt_pasted_cookies.set(e.value()),
-                            onkeydown: move |e| e.stop_propagation(),
-                        }
-                        div { class: "flex items-center gap-2 mt-1",
-                            button {
-                                class: "px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white text-xs transition-colors disabled:opacity-50",
-                                disabled: *firefox_busy.read(),
-                                onclick: move |_| {
-                                    firefox_busy.set(true);
-                                    firefox_error.set(None);
-                                    spawn(async move {
-                                        match server::ytmusic::manual_cookies::extract_from_firefox().await {
-                                            Ok(header) => yt_pasted_cookies.set(header),
-                                            Err(e) => firefox_error.set(Some(e)),
-                                        }
-                                        firefox_busy.set(false);
-                                    });
-                                },
-                                if *firefox_busy.read() {
-                                    i { class: "fa-solid fa-arrows-rotate fa-spin mr-1" }
-                                } else {
-                                    i { class: "fa-brands fa-firefox-browser mr-1" }
-                                }
-                                "{i18n::t(\"yt_paste_firefox\")}"
+                        // Manual cookie paste + Firefox import + auto-refresh —
+                        // hidden on Windows/Android where the in-app Google login is
+                        // the only offered method.
+                        if !one_click_only {
+                            ol { class: "text-xs text-white/60 list-decimal list-inside space-y-0.5 mb-2",
+                                li { "{i18n::t(\"yt_paste_step1\")}" }
+                                li { "{i18n::t(\"yt_paste_step2\")}" }
+                                li { "{i18n::t(\"yt_paste_step3\")}" }
                             }
-                            span { class: "text-[10px] text-white/40", "{i18n::t(\"yt_paste_firefox_hint\")}" }
-                        }
-                        if let Some(err) = firefox_error.read().clone() {
-                            p { class: "text-xs text-rose-300 mt-1 break-words", "{err}" }
+                            textarea {
+                                class: "w-full h-24 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white text-xs font-mono placeholder:text-white/30 focus:outline-none focus:border-indigo-400 resize-y",
+                                placeholder: "VISITOR_INFO1_LIVE=…; SID=…; SAPISID=…; …",
+                                value: "{yt_pasted_cookies()}",
+                                oninput: move |e| yt_pasted_cookies.set(e.value()),
+                                onkeydown: move |e| e.stop_propagation(),
+                            }
+                            div { class: "flex items-center gap-2 mt-1",
+                                button {
+                                    class: "px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white text-xs transition-colors disabled:opacity-50",
+                                    disabled: *firefox_busy.read(),
+                                    onclick: move |_| {
+                                        firefox_busy.set(true);
+                                        firefox_error.set(None);
+                                        spawn(async move {
+                                            match server::ytmusic::manual_cookies::extract_from_firefox().await {
+                                                Ok(header) => yt_pasted_cookies.set(header),
+                                                Err(e) => firefox_error.set(Some(e)),
+                                            }
+                                            firefox_busy.set(false);
+                                        });
+                                    },
+                                    if *firefox_busy.read() {
+                                        i { class: "fa-solid fa-arrows-rotate fa-spin mr-1" }
+                                    } else {
+                                        i { class: "fa-brands fa-firefox-browser mr-1" }
+                                    }
+                                    "{i18n::t(\"yt_paste_firefox\")}"
+                                }
+                                span { class: "text-[10px] text-white/40", "{i18n::t(\"yt_paste_firefox_hint\")}" }
+                            }
+                            if let Some(err) = firefox_error.read().clone() {
+                                p { class: "text-xs text-rose-300 mt-1 break-words", "{err}" }
+                            }
                         }
                         // Stay signed in automatically — re-read cookies from a
-                        // signed-in browser on every start + periodically.
-                        if let Some(mut cfg) = try_consume_context::<Signal<config::AppConfig>>() {
-                            label { class: "flex items-start gap-2 mt-3 text-xs text-white cursor-pointer",
-                                input {
-                                    r#type: "checkbox",
-                                    class: "mt-0.5",
-                                    checked: cfg.read().yt_auto_refresh,
-                                    onchange: move |e| cfg.write().yt_auto_refresh = e.checked(),
-                                }
-                                span {
-                                    class: "text-white/80",
-                                    "{i18n::t(\"yt_auto_refresh_label\")}"
+                        // signed-in *external* browser on every start. Only
+                        // meaningful with the browser methods, so it's hidden on
+                        // the one-click (in-app-login) platforms.
+                        if !one_click_only {
+                            if let Some(mut cfg) = try_consume_context::<Signal<config::AppConfig>>() {
+                                label { class: "flex items-start gap-2 mt-3 text-xs text-white cursor-pointer",
+                                    input {
+                                        r#type: "checkbox",
+                                        class: "mt-0.5",
+                                        checked: cfg.read().yt_auto_refresh,
+                                        onchange: move |e| cfg.write().yt_auto_refresh = e.checked(),
+                                    }
+                                    span {
+                                        class: "text-white/80",
+                                        "{i18n::t(\"yt_auto_refresh_label\")}"
+                                    }
                                 }
                             }
                         }
