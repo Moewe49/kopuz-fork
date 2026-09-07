@@ -298,6 +298,11 @@ pub fn use_player_task(ctrl: PlayerController) {
         let mut last_lyrics_prefetch_track: Option<String> = None;
         #[cfg(not(target_arch = "wasm32"))]
         let mut last_stream_prefetch_track: Option<String> = None;
+        // Dedup key for the ahead-of-time autoradio continuation fetch, so the
+        // per-tick check spawns it once — keyed by (play generation, queue len)
+        // so it re-arms only when the track or queue actually changes.
+        #[cfg(not(target_os = "android"))]
+        let mut autoradio_prefetched_for: Option<(usize, usize)> = None;
 
         async move {
             let mut last_progress_secs: u64 = u64::MAX;
@@ -644,6 +649,41 @@ pub fn use_player_task(ctrl: PlayerController) {
                     let duration = *ctrl.current_song_duration.read();
                     let pos_secs = pos.as_secs().min(duration);
                     let current_gen = *ctrl.play_generation.read();
+
+                    // Ahead-of-time autoradio: when the LAST queued track is
+                    // nearing its end and autoradio is on, fetch the
+                    // continuation now and append it, so the queue never runs
+                    // dry — playback flows straight in instead of stopping for a
+                    // cold fetch (the several-second gap when you start a single
+                    // song). The end-of-queue path in `play_next` stays as the
+                    // fallback if the fetch is slower than the remaining time.
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        use crate::use_player_controller::LoopMode;
+                        // ~8s fetch + a tick + ~3s first-track prewarm fits well
+                        // inside this lead.
+                        const AUTORADIO_PREFETCH_LEAD_SECS: u64 = 30;
+                        let qlen = ctrl.queue.peek().len();
+                        let idx = *ctrl.current_queue_index.read();
+                        let is_last = qlen > 0 && idx + 1 >= qlen;
+                        let loop_none = *ctrl.loop_mode.read() == LoopMode::None;
+                        let is_endless = duration == u64::MAX;
+                        let remaining = duration.saturating_sub(pos_secs);
+                        // duration == 0 means length is still unknown; prefetch
+                        // right away rather than never firing for that track.
+                        let near_end = duration == 0
+                            || (duration > 0 && remaining <= AUTORADIO_PREFETCH_LEAD_SECS);
+                        if config.read().autoradio
+                            && loop_none
+                            && is_last
+                            && !is_endless
+                            && near_end
+                            && autoradio_prefetched_for != Some((current_gen, qlen))
+                        {
+                            autoradio_prefetched_for = Some((current_gen, qlen));
+                            ctrl.prefetch_autoradio();
+                        }
+                    }
                     // On Android the position comes from ExoPlayer (set above), not the
                     // idle cpal stream — don't overwrite it with the stale cpal position.
                     #[cfg(not(target_os = "android"))]

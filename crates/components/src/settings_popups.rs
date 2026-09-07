@@ -278,6 +278,14 @@ fn ServerServiceFields(
     });
     let mut firefox_busy = use_signal(|| false);
     let mut firefox_error = use_signal(|| None::<String>);
+    // In-app one-click sign-in (opens a real Google sign-in in an embedded
+    // WebView — no external browser, no F12/cookie-paste). Captured cookies land
+    // in `yt_pasted_cookies`, so Save adopts them exactly like a paste. Desktop
+    // only — Android already has its own in-app sign-in via BrowserSignin.
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    let mut inapp_busy = use_signal(|| false);
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+    let mut inapp_error = use_signal(|| None::<String>);
 
     match server_service() {
         MusicService::YtMusic => {
@@ -329,6 +337,74 @@ fn ServerServiceFields(
                         OAuthSignIn { yt_pasted_cookies }
                     },
                     YtAuthMethod::PasteCookies => rsx! {
+                        // One-click in-app sign-in — the primary path. Opens a
+                        // real Google sign-in in an embedded WebView and captures
+                        // the session; the manual steps below stay as a fallback.
+                        {
+                            #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+                            {
+                                rsx! {
+                                    button {
+                                        class: "w-full px-3 py-2 rounded-lg bg-indigo-500 hover:bg-indigo-400 text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 mb-1",
+                                        disabled: *inapp_busy.read(),
+                                        onclick: move |_| {
+                                            if *inapp_busy.peek() {
+                                                return;
+                                            }
+                                            inapp_busy.set(true);
+                                            inapp_error.set(None);
+                                            spawn(async move {
+                                                player::systemint::start_yt_login();
+                                                // Poll ~6 min for the captured
+                                                // session (or a cancel/timeout).
+                                                for _ in 0..1200u32 {
+                                                    utils::sleep(std::time::Duration::from_millis(300)).await;
+                                                    match player::systemint::take_yt_login_result() {
+                                                        Some(c) if !c.trim().is_empty() => {
+                                                            yt_pasted_cookies.set(c);
+                                                            inapp_busy.set(false);
+                                                            return;
+                                                        }
+                                                        Some(_) => {
+                                                            inapp_error.set(Some(
+                                                                "Sign-in was cancelled or timed out — try again, or paste the cookies below.".to_string(),
+                                                            ));
+                                                            inapp_busy.set(false);
+                                                            return;
+                                                        }
+                                                        None => {}
+                                                    }
+                                                }
+                                                inapp_busy.set(false);
+                                            });
+                                        },
+                                        if *inapp_busy.read() {
+                                            i { class: "fa-solid fa-arrows-rotate fa-spin" }
+                                            "Waiting for sign-in…"
+                                        } else {
+                                            i { class: "fa-brands fa-google" }
+                                            "Sign in with Google"
+                                        }
+                                    }
+                                    p { class: "text-[10px] text-white/40 mb-2",
+                                        "Opens a Google sign-in inside kopuz — nothing to install, nothing to copy."
+                                    }
+                                    if let Some(err) = inapp_error.read().clone() {
+                                        p { class: "text-xs text-rose-300 mb-2 break-words", "{err}" }
+                                    }
+                                    if *inapp_busy.read() {
+                                        p { class: "text-[10px] text-white/40 mb-2",
+                                            "A sign-in window has opened. Finish signing in there; this closes on its own."
+                                        }
+                                    }
+                                    div { class: "text-[10px] text-white/30 uppercase tracking-wider mb-2", "— or paste cookies manually —" }
+                                }
+                            }
+                            #[cfg(any(target_arch = "wasm32", target_os = "android"))]
+                            {
+                                rsx! {}
+                            }
+                        }
                         ol { class: "text-xs text-white/60 list-decimal list-inside space-y-0.5 mb-2",
                             li { "{i18n::t(\"yt_paste_step1\")}" }
                             li { "{i18n::t(\"yt_paste_step2\")}" }
@@ -441,7 +517,7 @@ fn ServerServiceFields(
                 }
 
             }
-        },
+        }
         _ => rsx! {
             input {
                 placeholder: "{server_url_placeholder}",
@@ -487,7 +563,10 @@ fn OAuthSignIn(yt_pasted_cookies: Signal<String>) -> Element {
         let (cid, csec) = cfg_ctx
             .map(|c| {
                 let r = c.read();
-                (r.yt_oauth_client_id.clone(), r.yt_oauth_client_secret.clone())
+                (
+                    r.yt_oauth_client_id.clone(),
+                    r.yt_oauth_client_secret.clone(),
+                )
             })
             .unwrap_or_default();
         spawn(async move {

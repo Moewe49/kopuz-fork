@@ -38,6 +38,9 @@ use windows::Win32::Foundation::HWND;
 
 #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 mod pot_minter;
+// In-app YouTube sign-in WebView (one-click login, no external browser / F12).
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+mod yt_webview_login;
 // Shared BgUtils minter JS (desktop wry + Android System WebView).
 #[cfg(not(target_arch = "wasm32"))]
 mod pot_minter_script;
@@ -1342,6 +1345,9 @@ fn main() {
             .with_custom_event_handler(|_event, _target| {
                 crate::pot_minter::install_if_wanted(_target);
                 crate::pot_minter::pump();
+                // Drive the in-app YouTube sign-in WebView (needs the event and
+                // the event-loop target; both live only here).
+                crate::yt_webview_login::pump(_event, _target);
             })
             .with_asynchronous_custom_protocol(
                 "artwork",

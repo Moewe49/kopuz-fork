@@ -48,15 +48,34 @@ use std::sync::Mutex;
 
 static YT_LOGIN_RESULT: Mutex<Option<String>> = Mutex::new(None);
 
-/// Begin the in-app YouTube sign-in. On Android this opens the WebView sign-in
-/// dialog; poll [`take_yt_login_result`] for the captured cookies. No-op on
-/// desktop, which uses the managed-browser flow instead.
+/// Desktop: set by [`start_yt_login`] so the app's event-loop pump knows to open
+/// the in-app sign-in WebView on its next tick (the WebView must be created on
+/// the main/event-loop thread, which this crate can't reach directly). Android
+/// launches its dialog inline instead, so it doesn't use this flag.
+#[cfg(not(any(target_os = "android", target_os = "ios", target_arch = "wasm32")))]
+static YT_LOGIN_WANT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Begin the in-app YouTube sign-in. This opens a real Google/YT sign-in in an
+/// in-app WebView — no external browser to install, no F12/cookie-paste — and
+/// the captured session feeds the same `persist_yt_session` path as every other
+/// method. On Android it opens the WebView dialog inline; on desktop it raises a
+/// flag the app's event-loop pump acts on (see `kopuz::yt_webview_login`). Poll
+/// [`take_yt_login_result`] for the captured cookies either way.
 pub fn start_yt_login() {
     if let Ok(mut slot) = YT_LOGIN_RESULT.lock() {
         *slot = None;
     }
     #[cfg(target_os = "android")]
     android::launch_login();
+    #[cfg(not(any(target_os = "android", target_os = "ios", target_arch = "wasm32")))]
+    YT_LOGIN_WANT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Desktop event-loop pump: returns `true` once per [`start_yt_login`], the
+/// signal to stand up the in-app sign-in WebView.
+#[cfg(not(any(target_os = "android", target_os = "ios", target_arch = "wasm32")))]
+pub fn take_yt_login_want() -> bool {
+    YT_LOGIN_WANT.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Poll the in-app sign-in result: `None` while the user is still signing in,
@@ -65,9 +84,9 @@ pub fn take_yt_login_result() -> Option<String> {
     YT_LOGIN_RESULT.lock().ok().and_then(|mut s| s.take())
 }
 
-/// Delivered from the Android WebView via JNI when sign-in completes/cancels.
-#[cfg(target_os = "android")]
-pub(crate) fn set_yt_login_result(cookies: String) {
+/// Delivered when sign-in completes or cancels — from the Android WebView via
+/// JNI, or from the desktop in-app WebView pump. `""` means cancelled.
+pub fn set_yt_login_result(cookies: String) {
     if let Ok(mut slot) = YT_LOGIN_RESULT.lock() {
         *slot = Some(cookies);
     }

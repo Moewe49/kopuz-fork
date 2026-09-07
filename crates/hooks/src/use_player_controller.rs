@@ -1908,6 +1908,61 @@ impl PlayerController {
         true
     }
 
+    /// Fetch the autoradio continuation *ahead of time* and append it to the
+    /// queue while the last track is still playing, so the queue never actually
+    /// runs dry. Playback then flows straight into the continuation with no
+    /// stop-and-fetch gap — the existing next-track stream prewarm (in the
+    /// player task) warms the first continuation track's stream once it lands.
+    ///
+    /// Contrast with [`Self::try_start_autoradio`], the end-of-queue *fallback*
+    /// that replaces the queue only after playback has already stopped (a cold
+    /// fetch = the audible gap this method removes). This one keeps the current
+    /// track playing and only extends the queue, and it no-ops if the queue
+    /// changed underneath the in-flight fetch (the user re-queued, or the
+    /// fallback already fired) so it can never corrupt a moved-on queue.
+    pub(crate) fn prefetch_autoradio(&mut self) {
+        if !self.config.peek().autoradio {
+            return;
+        }
+        // Seed from the WHOLE current queue, exactly like the fallback, so the
+        // continuation matches the playlist's overall mix.
+        let finished: Vec<Track> = self.queue.peek().clone();
+        if finished.is_empty() {
+            return;
+        }
+        let seed_len = finished.len();
+        let seed_tail: Option<std::path::PathBuf> = finished.last().map(|t| t.path.clone());
+        let exclude: std::collections::HashSet<String> = finished
+            .iter()
+            .map(|t| ::server::recommend::track_key(&t.path))
+            .collect();
+        let cookies = self
+            .config
+            .peek()
+            .server
+            .as_ref()
+            .and_then(|s| s.access_token.clone())
+            .unwrap_or_default();
+        let mut ctrl = *self;
+        spawn(async move {
+            let tracks =
+                ::server::recommend::blended_continuation(&finished, &cookies, &exclude).await;
+            if tracks.is_empty() {
+                return;
+            }
+            // Only extend if the queue is still exactly the one we seeded from:
+            // same length AND same last track. If either moved, the fetch is
+            // stale — drop it rather than append onto a different queue.
+            let unchanged = {
+                let q = ctrl.queue.peek();
+                q.len() == seed_len && q.last().map(|t| &t.path) == seed_tail.as_ref()
+            };
+            if unchanged {
+                ctrl.add_to_queue(tracks);
+            }
+        });
+    }
+
     fn play_track_with_history(&mut self, track_idx: usize, allow_crossfade: bool) {
         let current_idx = *self.current_queue_index.peek();
         self.history.with_mut(|h| {
