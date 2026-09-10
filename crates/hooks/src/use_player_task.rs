@@ -141,12 +141,16 @@ pub fn use_player_task(ctrl: PlayerController) {
     let mut discord_cover_resolving_for = use_signal(String::new);
     #[cfg(not(target_arch = "wasm32"))]
     let mut discord_cover_sent = use_signal(|| false);
-    /// Playback position seen on the previous tick. A jump between two ticks
-    /// (which are 250ms apart) is a seek — Discord derives its progress bar
-    /// from the start timestamp we sent once, so without noticing the jump the
-    /// bar just keeps running from where the track *would* have been.
+    /// The elapsed position we last told Discord in a "now playing" update.
+    /// Discord derives its progress bar from that one timestamp and animates it
+    /// against the wall clock, so where the bar *currently* sits is
+    /// `last_sent_progress + (now − last_presence_send)`. Comparing the real
+    /// position to that predicted spot is how a seek is caught — and unlike a
+    /// tick-to-tick delta (the old approach), the divergence PERSISTS until we
+    /// re-send, so a seek is never lost just because it happened inside the
+    /// resend cooldown (which is exactly why scrubbing "did nothing" on Discord).
     #[cfg(not(target_arch = "wasm32"))]
-    let mut last_tick_progress: Signal<u64> = use_signal(|| 0);
+    let mut last_sent_progress: Signal<u64> = use_signal(|| 0);
     /// When the last activity was pushed. Discord rate-limits activity updates,
     /// and dragging the scrubber would otherwise fire one per tick.
     #[cfg(not(target_arch = "wasm32"))]
@@ -742,20 +746,22 @@ pub fn use_player_task(ctrl: PlayerController) {
                             // status appears as soon as Discord launches —
                             // not only on the next song change.
                             let retry_pending = *discord_send_pending.peek();
-                            // Scrubbing inside a track changed nothing on
-                            // Discord before: the position is only ever sent as
-                            // a start timestamp, and nothing re-sent it.
-                            // Throttled because Discord rate-limits activity
-                            // updates and a drag moves the position every tick.
-                            // Compared on the RAW position, not `progress`:
-                            // for a radio stream `progress` is pinned to 0
-                            // while the clock keeps running, so comparing the
-                            // two would read every tick as a jump.
-                            let seeked = pos.as_secs().abs_diff(*last_tick_progress.peek())
-                                > SEEK_JUMP_SECS
-                                && last_presence_send
-                                    .peek()
-                                    .is_none_or(|t| t.elapsed().as_secs() >= SEEK_RESEND_COOLDOWN);
+                            // Re-anchor the bar when the real position has
+                            // drifted from where Discord is currently drawing it
+                            // (predicted from the last timestamp we sent). That
+                            // catches a seek AND a stall/buffer, and because the
+                            // drift persists until we re-send, a seek inside the
+                            // resend cooldown isn't lost — it fires as soon as the
+                            // cooldown clears. Radio has no real position
+                            // (`progress` is pinned to 0), so it never seeks.
+                            let seeked = duration != u64::MAX
+                                && last_presence_send.peek().is_some_and(|t| {
+                                    let since = t.elapsed().as_secs();
+                                    let predicted =
+                                        last_sent_progress.peek().saturating_add(since);
+                                    since >= SEEK_RESEND_COOLDOWN
+                                        && pos.as_secs().abs_diff(predicted) > SEEK_JUMP_SECS
+                                });
 
                             if song_changed
                                 || resumed
@@ -785,6 +791,10 @@ pub fn use_player_task(ctrl: PlayerController) {
                                     );
                                 }
                                 last_presence_send.set(Some(web_time::Instant::now()));
+                                // Remember the position we told Discord, so the
+                                // next tick can predict where the bar sits and
+                                // detect a seek away from it.
+                                last_sent_progress.set(progress);
                                 discord_send_pending.set(!sent);
 
                                 if sent && resolved.is_some() {
@@ -984,10 +994,6 @@ pub fn use_player_task(ctrl: PlayerController) {
                 {
                     was_playing.set(is_playing);
                     last_discord_enabled = discord_enabled;
-                    // Every tick, so the seek check compares against the last
-                    // TICK — comparing against the last *send* would read a
-                    // minute of normal playback as a jump.
-                    last_tick_progress.set(pos.as_secs());
                 }
             }
         }
