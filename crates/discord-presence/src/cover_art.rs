@@ -42,7 +42,10 @@ pub fn direct_cover_url(track_path: &str) -> Option<String> {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
         if valid {
-            return Some(format!("https://i.ytimg.com/vi/{vid}/hqdefault.jpg"));
+            // `mqdefault` is the native 16:9 frame with NO padding. `hqdefault`
+            // /`sddefault` are 4:3 and letterbox a 16:9 source with black bars
+            // top and bottom — which is exactly what showed on the Discord cover.
+            return Some(format!("https://i.ytimg.com/vi/{vid}/mqdefault.jpg"));
         }
     }
     None
