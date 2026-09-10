@@ -141,14 +141,25 @@ async fn resolve_via_itunes(
     Ok(None)
 }
 
-async fn verify_cover_exists(
-    release_mbid: &str,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+/// Resolve a release's Cover Art Archive front image to a **direct** image URL.
+///
+/// The obvious `coverartarchive.org/release/<mbid>/front` URL is a 307 redirect
+/// to the actual image on archive.org. Discord's image proxy does NOT follow
+/// that redirect — it just fails to load, which is why a cover resolved via
+/// MusicBrainz showed up blank while an iTunes (direct `mzstatic`) URL worked.
+/// So we follow the redirect ourselves (a light HEAD; reqwest follows redirects
+/// by default) and hand Discord the final direct URL it can actually fetch.
+///
+/// Returns `None` if the release has no front cover (404) or the lookup fails.
+async fn caa_front_direct(release_mbid: &str) -> Option<String> {
     let url = cover_art_url(release_mbid);
-    let client = build_client()?;
-    let resp = client.head(&url).send().await?;
-    let status = resp.status();
-    Ok(status.is_success() || status.is_redirection())
+    let client = build_client().ok()?;
+    let resp = client.head(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    // The URL after redirects is the direct image on archive.org.
+    Some(resp.url().to_string())
 }
 
 pub async fn resolve_cover_art_url(
@@ -159,29 +170,21 @@ pub async fn resolve_cover_art_url(
     if let Some(id) = mbid
         && !id.is_empty()
     {
-        match verify_cover_exists(id).await {
-            Ok(true) => {
-                let url = cover_art_url(id);
-                tracing::info!("Resolved via embedded MBID -> {}", url);
-                return Some(url);
-            }
-            Ok(false) => {
-                tracing::warn!("Embedded MBID {} has no front cover, falling back", id)
-            }
-            Err(e) => tracing::warn!("Error verifying MBID {}: {}", id, e),
+        if let Some(url) = caa_front_direct(id).await {
+            tracing::info!("Resolved via embedded MBID -> {}", url);
+            return Some(url);
         }
+        tracing::warn!("Embedded MBID {} has no usable front cover, falling back", id);
     }
 
     match search_release_mbid(artist, album).await {
-        Ok(Some(release_id)) => match verify_cover_exists(&release_id).await {
-            Ok(true) => {
-                let url = cover_art_url(&release_id);
+        Ok(Some(release_id)) => {
+            if let Some(url) = caa_front_direct(&release_id).await {
                 tracing::info!("Resolved via MusicBrainz search -> {}", url);
                 return Some(url);
             }
-            Ok(false) => tracing::warn!("Release {} has no front cover", release_id),
-            Err(e) => tracing::warn!("Error verifying release {}: {}", release_id, e),
-        },
+            tracing::warn!("Release {} has no usable front cover", release_id);
+        }
         Ok(None) => tracing::info!(
             "No MusicBrainz match for artist=\"{}\" album=\"{}\"",
             artist,

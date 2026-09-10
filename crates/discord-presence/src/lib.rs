@@ -165,11 +165,7 @@ impl Presence {
     /// `m:ss`, or `h:mm:ss` past the hour — the shape a player shows, so a
     /// paused position reads as a position and not as a raw number.
     fn format_clock(total_secs: u64) -> String {
-        let (h, m, s) = (
-            total_secs / 3600,
-            (total_secs % 3600) / 60,
-            total_secs % 60,
-        );
+        let (h, m, s) = (total_secs / 3600, (total_secs % 3600) / 60, total_secs % 60);
         if h > 0 {
             format!("{h}:{m:02}:{s:02}")
         } else {
@@ -223,59 +219,36 @@ impl Presence {
         duration_secs: u64,
         cover_url: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Discord has no paused state, so the position goes in the TEXT.
+        // Discord has NO paused state and NO way to freeze a progress bar: a bar
+        // is always derived from a `start` timestamp and animated live against
+        // the wall clock, so ANY timestamp keeps moving. The old approach
+        // backdated `start` and re-sent every few seconds to snap it back — but
+        // between snaps the bar visibly creeps, so a paused track just looked
+        // like it was still playing ("der Balken läuft weiter").
         //
-        // A bar that stands still is not expressible: Discord derives it from a
-        // start timestamp and renders it live against the wall clock, so any
-        // timestamp counts. Dropping the timestamps doesn't stop it either —
-        // measured behaviour is that Discord then falls back to counting from
-        // the moment the activity was set, which is why a track paused at 3:00
-        // showed a bar restarting near zero. Strictly worse than the truth.
+        // So when paused we send **no timestamps at all** — then Discord draws no
+        // bar and nothing animates. The frozen position lives in the TEXT (the
+        // one part of an activity that genuinely holds still), shown as
+        // `⏸ m:ss / m:ss`, which reads unambiguously as paused-at-a-position.
         //
-        // Text is the one part of an activity that holds still, so the frozen
-        // position is written there. The timestamps are sent explicitly empty
-        // rather than omitted — an omitted key can only ever mean "unchanged",
-        // and this needs to mean "there is no position to animate".
-        //
-        // Note when debugging this: the IPC client writes the frame and returns
-        // Ok without reading Discord's reply, so a rejected activity logs
-        // exactly like an accepted one. The log line proves the write, nothing
-        // more.
-        // Anchor the bar to the paused position, and re-anchor periodically.
-        //
-        // Discord has no way to pin the bar to a time — the reference
-        // implementation for this exact problem says so in its own changelog
-        // (ungive/discord-music-presence 2.2.5: "'frozen' means stuck at 0:00
-        // since Discord doesn't offer a way to pin it to a specific time").
-        // The bar is always derived from `start` and animated against the wall
-        // clock; there is no static mode.
-        //
-        // But `start` can be BACKDATED. Sending `now - elapsed` puts the bar
-        // exactly on the paused position at the moment it is sent. It then
-        // creeps forward, so the caller re-sends every few seconds and it snaps
-        // back — near-static, drifting by at most the resend interval, instead
-        // of showing a number that means nothing at all.
-        //
-        // `end` goes along so Discord draws a real progress bar at the right
-        // fraction rather than a bare count-up.
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-        let start_time = now - elapsed_secs as i64;
-        let timestamps = if duration_secs == 0 || duration_secs == u64::MAX {
-            Timestamps::new().start(start_time)
+        // (The caller still re-sends this every few seconds. That's not to move a
+        // bar — there's none now — but to keep the IPC pipe warm so an idle
+        // connection isn't dropped mid-pause, which is what made the activity
+        // vanish entirely before.)
+        let position = if duration_secs == 0 || duration_secs == u64::MAX {
+            Self::format_clock(elapsed_secs)
         } else {
-            Timestamps::new()
-                .start(start_time)
-                .end(start_time + duration_secs as i64)
+            format!(
+                "{} / {}",
+                Self::format_clock(elapsed_secs),
+                Self::format_clock(duration_secs)
+            )
         };
-
-        // The text keeps the exact position too: it is the only part that truly
-        // holds still, and it stays correct between re-anchors.
-        let state = format!("{artist} • Paused {}", Self::format_clock(elapsed_secs));
+        let state = format!("{artist} • ⏸ {position}");
         let mut activity = activity::Activity::new()
             .details(title)
             .state(&state)
             .status_display_type(activity::StatusDisplayType::State)
-            .timestamps(timestamps)
             .activity_type(activity::ActivityType::Listening);
 
         if let Some(url) = cover_url {
