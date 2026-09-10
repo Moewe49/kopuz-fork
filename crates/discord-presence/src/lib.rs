@@ -203,7 +203,11 @@ impl Presence {
             .activity_type(activity::ActivityType::Listening);
 
         if let Some(url) = cover_url {
-            let assets = Assets::new().large_image(url).large_text(album);
+            // Cover only — no album text. Discord shows just the song (details)
+            // and the artist (state); `album` stays in the signature because the
+            // cover lookup still keys on it, but it is never displayed.
+            let _ = album;
+            let assets = Assets::new().large_image(url);
             activity = activity.assets(assets);
         }
 
@@ -252,7 +256,11 @@ impl Presence {
             .activity_type(activity::ActivityType::Listening);
 
         if let Some(url) = cover_url {
-            let assets = Assets::new().large_image(url).large_text(album);
+            // Cover only — no album text. Discord shows just the song (details)
+            // and the artist (state); `album` stays in the signature because the
+            // cover lookup still keys on it, but it is never displayed.
+            let _ = album;
+            let assets = Assets::new().large_image(url);
             activity = activity.assets(assets);
         }
 
