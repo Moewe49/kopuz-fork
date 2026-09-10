@@ -28,6 +28,26 @@ pub fn cover_art_url(release_mbid: &str) -> String {
     format!("{}/release/{}/front", COVER_ART_ARCHIVE, release_mbid)
 }
 
+/// A correct, public cover URL derived straight from the track's source — no
+/// guessing by artist/album (which is what produced *wrong* covers). Currently
+/// YouTube: the video's own thumbnail is the artwork, is public, and Discord's
+/// image proxy loads it fine. Returns `None` for sources with no public cover
+/// URL (local files, Jellyfin/Subsonic servers Discord can't reach), which then
+/// fall back to the metadata lookup.
+pub fn direct_cover_url(track_path: &str) -> Option<String> {
+    if let Some(rest) = track_path.strip_prefix("ytmusic:") {
+        let vid = rest.split(':').next().unwrap_or(rest);
+        let valid = !vid.is_empty()
+            && vid
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if valid {
+            return Some(format!("https://i.ytimg.com/vi/{vid}/hqdefault.jpg"));
+        }
+    }
+    None
+}
+
 fn escape_lucene(input: &str) -> String {
     let special = [
         '\\', '+', '-', '!', '(', ')', ':', '^', '[', ']', '"', '{', '}', '~', '*', '?', '|', '&',
@@ -175,6 +195,18 @@ pub async fn resolve_cover_art_url(
             return Some(url);
         }
         tracing::warn!("Embedded MBID {} has no usable front cover, falling back", id);
+    }
+
+    // Without an album we'd be guessing by artist alone, which returns whatever
+    // release ranks first — the "confidently wrong cover" problem. Better to show
+    // no cover than the wrong one. (YouTube tracks never reach here: the caller
+    // uses the video thumbnail via `direct_cover_url`.)
+    if album.trim().is_empty() {
+        tracing::info!(
+            "No album for artist=\"{}\" — skipping cover guess to avoid a wrong match",
+            artist
+        );
+        return None;
     }
 
     match search_release_mbid(artist, album).await {

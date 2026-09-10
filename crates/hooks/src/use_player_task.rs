@@ -712,28 +712,40 @@ pub fn use_player_task(ctrl: PlayerController) {
 
                         if discord_enabled && song_key != *discord_cover_resolving_for.peek() {
                             discord_cover_resolving_for.set(song_key.clone());
-                            discord_cover_url.set(None);
                             discord_cover_sent.set(false);
 
-                            let mbid = {
+                            let (mbid, track_path) = {
                                 let idx = *ctrl.current_queue_index.read();
-                                ctrl.get_track_at(idx)
-                                    .and_then(|t| t.musicbrainz_release_id.clone())
-                            };
-                            let artist_c = artist.clone();
-                            let album_c = album.clone();
-                            let song_key_for_spawn = song_key.clone();
-                            spawn(async move {
-                                let resolved = cover_art::resolve_cover_art_url(
-                                    mbid.as_deref(),
-                                    &artist_c,
-                                    &album_c,
+                                let t = ctrl.get_track_at(idx);
+                                (
+                                    t.as_ref().and_then(|t| t.musicbrainz_release_id.clone()),
+                                    t.map(|t| t.path.to_string_lossy().into_owned()),
                                 )
-                                .await;
-                                if *discord_cover_resolving_for.peek() == song_key_for_spawn {
-                                    discord_cover_url.set(resolved);
-                                }
-                            });
+                            };
+                            // A source with a correct public cover (YouTube
+                            // thumbnail) is used as-is — no artist/album guessing,
+                            // which is what showed the WRONG cover.
+                            if let Some(direct) =
+                                track_path.as_deref().and_then(cover_art::direct_cover_url)
+                            {
+                                discord_cover_url.set(Some(direct));
+                            } else {
+                                discord_cover_url.set(None);
+                                let artist_c = artist.clone();
+                                let album_c = album.clone();
+                                let song_key_for_spawn = song_key.clone();
+                                spawn(async move {
+                                    let resolved = cover_art::resolve_cover_art_url(
+                                        mbid.as_deref(),
+                                        &artist_c,
+                                        &album_c,
+                                    )
+                                    .await;
+                                    if *discord_cover_resolving_for.peek() == song_key_for_spawn {
+                                        discord_cover_url.set(resolved);
+                                    }
+                                });
+                            }
                         }
 
                         if discord_enabled {
