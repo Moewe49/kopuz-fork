@@ -249,10 +249,17 @@ impl Presence {
             )
         };
         let state = format!("{artist} • ⏸ {position}");
+        // CRUCIAL: send an EXPLICIT empty timestamps object, not an omitted one.
+        // Omitting the key means "unchanged" to Discord, so it keeps the `start`
+        // from the last *playing* update and shows a green timer that keeps
+        // climbing (2:08, 2:09, …) even though we're paused. An explicit empty
+        // `{}` clears it — no bar, no counter — leaving just the frozen position
+        // in the text.
         let mut activity = activity::Activity::new()
             .details(title)
             .state(&state)
             .status_display_type(activity::StatusDisplayType::State)
+            .timestamps(Timestamps::new())
             .activity_type(activity::ActivityType::Listening);
 
         if let Some(url) = cover_url {
