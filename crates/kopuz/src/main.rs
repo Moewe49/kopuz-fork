@@ -240,7 +240,7 @@ async fn fetch_available_update_via_redirect() -> Option<AvailableUpdate> {
         .build()
         .ok()?;
     let resp = client
-        .get("https://github.com/Moewe49/kopuz/releases/latest")
+        .get("https://github.com/Moewe49/kopuz-fork/releases/latest")
         .send()
         .await
         .ok()?;
@@ -256,9 +256,10 @@ async fn fetch_available_update_via_redirect() -> Option<AvailableUpdate> {
     tracing::info!("[update] found {tag} via the redirect path (API unavailable)");
     Some(AvailableUpdate {
         version: tag.trim_start_matches(['v', 'V']).to_string(),
-        release_url: format!("https://github.com/Moewe49/kopuz/releases/tag/{tag}"),
-        installer_url: platform_asset_name()
-            .map(|name| format!("https://github.com/Moewe49/kopuz/releases/download/{tag}/{name}")),
+        release_url: format!("https://github.com/Moewe49/kopuz-fork/releases/tag/{tag}"),
+        installer_url: platform_asset_name().map(|name| {
+            format!("https://github.com/Moewe49/kopuz-fork/releases/download/{tag}/{name}")
+        }),
     })
 }
 
@@ -269,14 +270,14 @@ async fn fetch_available_update() -> Option<AvailableUpdate> {
         .timeout(std::time::Duration::from_secs(8))
         .build()
         .ok()?;
-    // This fork's own releases (Moewe49/kopuz), not the upstream Kopuz-org repo —
-    // otherwise the in-app updater would offer upstream builds that don't carry
-    // this fork's Android work.
+    // This fork's own releases (Moewe49/kopuz-fork), not the upstream Kopuz-org
+    // repo — otherwise the in-app updater would offer upstream builds that don't
+    // carry this fork's Android work.
     // Every failure here used to end as `None`, indistinguishable from "you are
     // up to date" — no log line, no button, nothing to look at. A 403 from the
     // rate limit looked exactly like a release that was never published.
     let release = match client
-        .get("https://api.github.com/repos/Moewe49/kopuz/releases/latest")
+        .get("https://api.github.com/repos/Moewe49/kopuz-fork/releases/latest")
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .send()
         .await
