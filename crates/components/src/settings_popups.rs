@@ -275,14 +275,12 @@ fn ServerServiceFields(
     // profile's cookies. Hide that option there; manual cookies are
     // the Windows sign-in path.
     use_effect(move || {
-        // OAuth is hidden (broken by Google) — fall back to paste. On Windows and
-        // Android the ONLY sign-in is the one-click in-app Google login (surfaced
-        // from the paste panel), so coerce the external-browser method away there
-        // too — it isn't offered.
+        // OAuth is hidden (broken by Google) — fall back to paste. Only Android
+        // hides the external-browser method (it has no desktop browser to drive),
+        // so coerce it away there; on desktop it stays selectable.
         let m = *yt_auth.peek();
         let hidden = m == YtAuthMethod::OAuth
-            || (cfg!(any(target_os = "windows", target_os = "android"))
-                && m == YtAuthMethod::BrowserSignin);
+            || (cfg!(target_os = "android") && m == YtAuthMethod::BrowserSignin);
         if hidden {
             yt_auth.set(YtAuthMethod::PasteCookies);
         }
@@ -301,10 +299,15 @@ fn ServerServiceFields(
     match server_service() {
         MusicService::YtMusic => {
             let method = yt_auth();
-            // Windows and Android offer ONLY the one-click in-app Google sign-in
-            // (+ anonymous). Other desktops keep the full set, including the
-            // external-browser auto-login.
-            let one_click_only = cfg!(any(target_os = "windows", target_os = "android"));
+            // Only Android offers ONLY the one-click in-app Google sign-in (+
+            // anonymous) — a phone can't easily grab a DevTools cookie header.
+            // Desktop (Windows included) keeps the FULL set: the Google button is
+            // still there in the paste panel, but manual cookie paste and the
+            // external-browser sign-in stay available too. Hiding paste on
+            // Windows had cost users their durable "paste once, lasts for days"
+            // workflow — the in-app login makes a manual session with no
+            // persistent-browser refresh behind it.
+            let one_click_only = cfg!(target_os = "android");
             // On the one-click platforms the "paste cookies" method IS the Google
             // sign-in (the captured cookies flow through the paste save path), so
             // label its radio accordingly.
