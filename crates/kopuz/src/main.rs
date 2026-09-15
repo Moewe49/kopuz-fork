@@ -2238,6 +2238,70 @@ fn App() -> Element {
         });
     });
 
+    // Android: keep a signed-in YT session alive WITHOUT ever re-logging in. A
+    // headless music.youtube.com WebView (YtRefresh) reloads itself so YouTube
+    // rotates the session cookies, and here we adopt each freshly-pulled jar as
+    // the active session — so a phone stops hitting "cookies expired" every few
+    // hours. (Desktop uses the managed-browser refresh + HTTP keepalive.)
+    #[cfg(target_os = "android")]
+    let mut yt_refresh_started = use_signal(|| false);
+    #[cfg(target_os = "android")]
+    use_effect(move || {
+        if !*initial_load_done.read() {
+            return;
+        }
+        let want = config
+            .read()
+            .server
+            .as_ref()
+            .map(|s| {
+                s.service == config::MusicService::YtMusic
+                    && !s.yt_anonymous
+                    && s.access_token.as_deref().is_some_and(|t| !t.is_empty())
+            })
+            .unwrap_or(false);
+        if !want || *yt_refresh_started.peek() {
+            return;
+        }
+        yt_refresh_started.set(true);
+        // Stand up the offscreen keepalive WebView.
+        player::systemint::start_yt_cookie_refresh();
+        spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let still = config
+                    .peek()
+                    .server
+                    .as_ref()
+                    .map(|s| s.service == config::MusicService::YtMusic && !s.yt_anonymous)
+                    .unwrap_or(false);
+                if !still {
+                    yt_refresh_started.set(false);
+                    return;
+                }
+                let Some(fresh) = player::systemint::take_yt_refreshed_cookies() else {
+                    continue;
+                };
+                let uid = server::ytmusic::derive_user_id(&fresh);
+                let mut cfg = config.write();
+                let saved_id = cfg.server.as_ref().and_then(|s| s.id.clone());
+                if let Some(srv) = cfg.server.as_mut() {
+                    srv.access_token = Some(fresh.clone());
+                    if let Some(u) = uid {
+                        srv.user_id = Some(u);
+                    }
+                }
+                // Persist to the saved entry too, so a restart restores the
+                // still-valid rotated jar rather than the original captured one.
+                if let Some(id) = saved_id
+                    && let Some(saved) = cfg.servers.iter_mut().find(|s| s.id == id)
+                {
+                    saved.yt_saved_cookies = Some(fresh);
+                }
+            }
+        });
+    });
+
     // OAuth "always signed in": when a refresh token is stored, mint a fresh
     // access token on boot and every 45 min (tokens live ~1h). No browser, so
     // this runs on every platform including mobile.

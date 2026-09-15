@@ -693,6 +693,52 @@ pub extern "system" fn Java_com_temidaradev_kopuz_YtLogin_nativeOnYtCookies(
     super::set_yt_login_result(s);
 }
 
+/// Start (or nudge) the headless cookie keepalive WebView (`YtRefresh.start`),
+/// which reloads a signed-in music.youtube.com offscreen and re-pulls the
+/// rotated cookies so a captured session never goes stale. Fresh jars arrive via
+/// `nativeOnRefreshedCookies` below.
+pub fn launch_refresh() {
+    init();
+    let Some(vm) = JVM.get() else { return };
+    let Ok(mut env) = vm.attach_current_thread() else {
+        return;
+    };
+    let ctx = ndk_context::android_context();
+    let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
+    let result: Result<(), jni::errors::Error> = (|| {
+        let class = find_app_class(&mut env, "com/temidaradev/kopuz/YtRefresh")?;
+        env.call_static_method(
+            &class,
+            "start",
+            "(Landroid/content/Context;)V",
+            &[JValue::Object(&activity)],
+        )?
+        .v()?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        eprintln!("[android] YtRefresh.start failed: {}", e);
+        clear_jni_exception(&mut env);
+    }
+}
+
+// Called from Kotlin: YtRefresh.nativeOnRefreshedCookies(String) — a freshly
+// rotated, signed-in cookie jar. The app persists it as the active YT session.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_temidaradev_kopuz_YtRefresh_nativeOnRefreshedCookies(
+    mut env: JNIEnv,
+    _class: JClass,
+    cookies: JString,
+) {
+    let Ok(s) = env.get_string(&cookies) else {
+        return;
+    };
+    let s: String = s.into();
+    if !s.trim().is_empty() {
+        super::set_yt_refreshed_cookies(s);
+    }
+}
+
 // --- Headless PoToken minter (BgUtils in an Android System WebView) --------------
 // The desktop wry minter is unavailable on a phone; instead PotMinter.kt hosts an
 // offscreen System WebView at the music.youtube.com origin that runs the SAME

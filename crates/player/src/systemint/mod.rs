@@ -84,6 +84,36 @@ pub fn take_yt_login_result() -> Option<String> {
     YT_LOGIN_RESULT.lock().ok().and_then(|mut s| s.take())
 }
 
+/// Freshly-rotated cookie jar from the headless keepalive (Android `YtRefresh`),
+/// waiting for the app to adopt it as the active session.
+static YT_REFRESHED_COOKIES: Mutex<Option<String>> = Mutex::new(None);
+
+/// Start (or nudge) the background cookie keepalive: a signed-in
+/// music.youtube.com that reloads itself periodically so YouTube rotates the
+/// session cookies, then re-pulls them — the app then adopts the fresh jar via
+/// [`take_yt_refreshed_cookies`]. This is what makes "sign in once, stays valid
+/// for days" work on a phone. On Android it drives the offscreen `YtRefresh`
+/// WebView; desktop keeps the session fresh through the managed-browser refresh
+/// and the HTTP keepalive instead, so this is a no-op there.
+pub fn start_yt_cookie_refresh() {
+    #[cfg(target_os = "android")]
+    android::launch_refresh();
+}
+
+/// Deliver a freshly-rotated cookie jar (Android JNI → here).
+#[cfg(target_os = "android")]
+pub(crate) fn set_yt_refreshed_cookies(cookies: String) {
+    if let Ok(mut slot) = YT_REFRESHED_COOKIES.lock() {
+        *slot = Some(cookies);
+    }
+}
+
+/// Poll the latest keepalive-refreshed cookie jar (or `None`). The app persists
+/// it as the active YT session so subsequent requests use the fresh cookies.
+pub fn take_yt_refreshed_cookies() -> Option<String> {
+    YT_REFRESHED_COOKIES.lock().ok().and_then(|mut s| s.take())
+}
+
 /// Delivered when sign-in completes or cancels — from the Android WebView via
 /// JNI, or from the desktop in-app WebView pump. `""` means cancelled.
 pub fn set_yt_login_result(cookies: String) {
