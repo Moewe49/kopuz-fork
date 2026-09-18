@@ -208,6 +208,22 @@ async fn search_ytmusic_tracks(
     if query.trim().is_empty() {
         return Some((Vec::new(), Vec::new()));
     }
+    // A pasted YouTube / YT-Music link plays directly, bypassing the catalog
+    // search — which only indexes YT Music songs, so a plain YouTube video (or a
+    // brand-new upload) never shows up otherwise.
+    if let Some(track) = server::ytmusic::search::resolve_link(query).await {
+        let path_str = track.path.to_string_lossy().to_string();
+        let cover_url =
+            utils::map_cover_url(utils::jellyfin_image::track_cover_url_with_album_fallback(
+                &path_str,
+                &track.album_id,
+                "",
+                None,
+                80,
+                80,
+            ));
+        return Some((vec![(track, cover_url)], Vec::new()));
+    }
     let client = match cookies {
         Some(c) if !c.is_empty() => server::ytmusic::YouTubeMusicClient::with_cookies(c),
         _ => server::ytmusic::YouTubeMusicClient::new(),
@@ -224,16 +240,15 @@ async fn search_ytmusic_tracks(
         .into_iter()
         .map(|t| {
             let path_str = t.path.to_string_lossy();
-            let cover_url = utils::map_cover_url(
-                utils::jellyfin_image::track_cover_url_with_album_fallback(
+            let cover_url =
+                utils::map_cover_url(utils::jellyfin_image::track_cover_url_with_album_fallback(
                     &path_str,
                     &t.album_id,
                     "",
                     None,
                     80,
                     80,
-                ),
-            );
+                ));
             (t, cover_url)
         })
         .collect();
@@ -384,7 +399,11 @@ pub fn use_search_data(
         let query = debounced.read().clone();
         let (active_source, active_service, server) = {
             let conf = config.read();
-            (conf.active_source.clone(), conf.active_service(), conf.server.clone())
+            (
+                conf.active_source.clone(),
+                conf.active_service(),
+                conf.server.clone(),
+            )
         };
         let (tr, al) = {
             let lib = library.read();

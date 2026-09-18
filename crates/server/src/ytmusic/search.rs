@@ -570,6 +570,87 @@ fn parsed_to_track(p: ParsedRow) -> Track {
     }
 }
 
+/// Extract an 11-char YouTube video id from a link: `youtu.be/ID`,
+/// `…/watch?v=ID` (incl. `music.youtube.com`), `…/shorts/ID`, `…/embed/ID`,
+/// `…/live/ID`. Only YouTube-looking input is considered, so a normal search
+/// query is never mistaken for a link.
+pub fn parse_video_id(input: &str) -> Option<String> {
+    let s = input.trim();
+    if !s.contains("youtu") {
+        return None;
+    }
+    let is_id = |t: &str| {
+        t.len() == 11 && t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    };
+    let take_id = |rest: &str| -> Option<String> {
+        let id: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        is_id(&id).then_some(id)
+    };
+    if let Some(pos) = s.find("v=")
+        && let Some(id) = take_id(&s[pos + 2..])
+    {
+        return Some(id);
+    }
+    for marker in ["youtu.be/", "/shorts/", "/embed/", "/live/"] {
+        if let Some(pos) = s.find(marker)
+            && let Some(id) = take_id(&s[pos + marker.len()..])
+        {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// If `input` is a YouTube/YT-Music video link, resolve it to a single playable
+/// [`Track`] via YouTube's public oembed endpoint (no auth, works for any public
+/// video) — so a pasted link plays even when the video isn't in the YT Music
+/// search catalog (which the normal search only covers). Returns `None` for
+/// non-links and for videos oembed can't resolve (private/removed), so the
+/// caller falls back to a normal search.
+pub async fn resolve_link(input: &str) -> Option<Track> {
+    let video_id = parse_video_id(input)?;
+    let resp = super::innertube::http_client()
+        .get("https://www.youtube.com/oembed")
+        .query(&[
+            ("url", format!("https://youtu.be/{video_id}").as_str()),
+            ("format", "json"),
+        ])
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: Value = resp.json().await.ok()?;
+    let title = v.get("title").and_then(|x| x.as_str())?.trim().to_string();
+    if title.is_empty() {
+        return None;
+    }
+    let author = v
+        .get("author_name")
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    Some(parsed_to_track(ParsedRow {
+        video_id: video_id.clone(),
+        title,
+        artists: if author.is_empty() {
+            Vec::new()
+        } else {
+            vec![author]
+        },
+        album: None,
+        album_browse_id: None,
+        duration: 0,
+        // 16:9 thumbnail with no letterbox (hqdefault is 4:3 with black bars).
+        thumbnail_url: Some(format!("https://i.ytimg.com/vi/{video_id}/mqdefault.jpg")),
+    }))
+}
+
 fn pick_run(row: &Value, col: usize, run: usize) -> String {
     row.get("flexColumns")
         .and_then(|c| c.as_array())
@@ -907,6 +988,41 @@ fn parse_entity_row(item: &Value) -> Option<super::discover::DiscoverItem> {
         });
     }
     None
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::parse_video_id;
+
+    #[test]
+    fn extracts_id_from_common_link_shapes() {
+        let id = "5X2-w4ORTy4";
+        assert_eq!(parse_video_id("https://youtu.be/5X2-w4ORTy4").as_deref(), Some(id));
+        // The exact link from the report — youtu.be + an RD radio list.
+        assert_eq!(
+            parse_video_id("https://youtu.be/5X2-w4ORTy4?list=RD5X2-w4ORTy4").as_deref(),
+            Some(id)
+        );
+        assert_eq!(
+            parse_video_id("https://www.youtube.com/watch?v=5X2-w4ORTy4&t=30s").as_deref(),
+            Some(id)
+        );
+        assert_eq!(
+            parse_video_id("https://music.youtube.com/watch?v=5X2-w4ORTy4").as_deref(),
+            Some(id)
+        );
+        assert_eq!(parse_video_id("https://www.youtube.com/shorts/5X2-w4ORTy4").as_deref(), Some(id));
+    }
+
+    #[test]
+    fn ignores_normal_search_queries() {
+        // A plain query is never mistaken for a link — even an 11-char one.
+        assert_eq!(parse_video_id("creepy nuts"), None);
+        assert_eq!(parse_video_id("helloworld1"), None);
+        assert_eq!(parse_video_id(""), None);
+        // "youtu"-ish text without a real 11-char id yields nothing.
+        assert_eq!(parse_video_id("youtube playlist mix"), None);
+    }
 }
 
 #[cfg(test)]
