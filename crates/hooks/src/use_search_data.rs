@@ -25,6 +25,10 @@ fn search_local(
     tracks: Vec<Track>,
     albums: Vec<Album>,
 ) -> Option<(TrackRes, AlbumRes)> {
+    // The query now arrives in its original case (see the debounce); lowercase it
+    // here for case-insensitive substring matching.
+    let lc = query.to_lowercase();
+    let query = lc.as_str();
     let album_map: std::collections::HashMap<&String, &Album> =
         albums.iter().map(|a| (&a.id, a)).collect();
 
@@ -78,6 +82,9 @@ fn search_server(
     active_service: Option<MusicService>,
     server: Option<config::MusicServer>,
 ) -> Option<(TrackRes, AlbumRes)> {
+    // Query arrives in original case now; lowercase for matching.
+    let lc = query.to_lowercase();
+    let query = lc.as_str();
     let result_tracks: TrackRes = tracks
         .iter()
         .filter(|t| {
@@ -385,10 +392,14 @@ pub fn use_search_data(
     // settled query (unchanged for ~280 ms) actually runs.
     let mut debounced = use_signal(String::new);
     use_effect(move || {
-        let q = search_query.read().to_lowercase();
+        // Keep the ORIGINAL case: a pasted YouTube link carries a case-sensitive
+        // video id (5X2-w4ORTy4 ≠ 5x2-w4orty4), so lowercasing here broke
+        // paste-to-play. Local/server search lowercase internally for matching;
+        // YouTube's own search is case-insensitive anyway.
+        let q = search_query.read().clone();
         spawn(async move {
             utils::sleep(std::time::Duration::from_millis(280)).await;
-            if search_query.peek().to_lowercase() == q {
+            if *search_query.peek() == q {
                 debounced.set(q);
             }
         });
