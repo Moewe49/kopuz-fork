@@ -416,24 +416,42 @@ impl YouTubeMusicClient {
         // + ANDROID_VR + bare clients, seconds each) every single track — so
         // after the first track resolves via anonymous yt-dlp we go straight
         // there. The full chain still runs as a fallback if the shortcut fails.
-        if ytdlp && preferred_strategy() == STRAT_YTDLP_ANON {
-            if let Ok(info) = ytdlp_resolve::resolve(video_id, None).await {
-                return Ok(info);
+        if ytdlp {
+            let strat = preferred_strategy();
+            if strat == STRAT_YTDLP_ANON {
+                if let Ok(info) = ytdlp_resolve::resolve(video_id, None).await {
+                    return Ok(info);
+                }
+            } else if strat == STRAT_YTDLP_COOKIES && self.cookie_jar().is_some() {
+                if let Ok(info) = ytdlp_resolve::resolve(video_id, self.cookie_jar()).await {
+                    return Ok(info);
+                }
             }
         }
 
         let native = player::resolve(video_id, self.cookies.as_deref()).await;
+        // A deep-range-UNSAFE native stream — signed-in but non-Premium AND the
+        // content-PO-token mint failed — plays the front and then 403s on deep
+        // byte ranges, which the player reads as a dead track and skips (the
+        // "songs skip mid-track" bug). Don't accept it while yt-dlp could resolve
+        // a full stream; keep it only as a last resort so playback still beats
+        // silence when yt-dlp can't help either.
+        let mut native_unsafe: Option<YtStreamInfo> = None;
         let native_err = match native {
-            Ok(info) => {
+            Ok(info) if info.deep_range_safe || !ytdlp => {
                 set_preferred_strategy(STRAT_NATIVE);
                 return Ok(info);
+            }
+            Ok(info) => {
+                native_unsafe = Some(info);
+                "native stream not deep-range-safe (non-Premium, no PO token)".to_string()
             }
             Err(e) => e,
         };
         if !ytdlp {
             return Err(native_err);
         }
-        eprintln!("[yt-player] native resolve failed ({native_err}) — trying yt-dlp fallback");
+        eprintln!("[yt-player] {native_err} — trying yt-dlp fallback");
 
         // Try yt-dlp WITH cookies first (needed for Premium / age-gated), but
         // if that fails retry ANONYMOUSLY: a signed-in session that's been
@@ -465,10 +483,18 @@ impl YouTubeMusicClient {
                 set_preferred_strategy(STRAT_YTDLP_ANON);
                 Ok(info)
             }
-            Err(anon_err) => Err(format!(
-                "{native_err}; yt-dlp fallback also failed: {}",
-                ydl_err.unwrap_or(anon_err)
-            )),
+            // yt-dlp couldn't help either — a front-only native stream still beats
+            // a hard failure, so fall back to it if we held one.
+            Err(anon_err) => match native_unsafe {
+                Some(info) => {
+                    set_preferred_strategy(STRAT_NATIVE);
+                    Ok(info)
+                }
+                None => Err(format!(
+                    "{native_err}; yt-dlp fallback also failed: {}",
+                    ydl_err.unwrap_or(anon_err)
+                )),
+            },
         }
     }
 
